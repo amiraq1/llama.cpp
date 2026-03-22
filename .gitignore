@@ -1,0 +1,22 @@
+.gradle/
+.kotlin/
+local.properties
+build/
+captures/
+.idea/
+*.iml
+app/build/
+app/.cxx/
+
+# Local model files and device-only data
+models/
+device-db/
+*.gguf
+*.db
+*.db-*
+
+# Temporary exports and UI dumps created during device testing
+/*.xml
+tmp-test.txt
+local-ai-hub-device.db
+/.tmp-llama-cpp/
