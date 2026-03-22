@@ -7,6 +7,9 @@ plugins {
     alias(libs.plugins.hilt.android)
 }
 
+val enableVulkanBackend = providers.gradleProperty("localai.enableVulkan").orNull == "true"
+val enableOpenClBackend = providers.gradleProperty("localai.enableOpencl").orNull == "true"
+
 android {
     namespace = "com.localai.hub"
     compileSdk = 36
@@ -42,7 +45,9 @@ android {
                     "-DGGML_NATIVE=OFF",
                     "-DGGML_BACKEND_DL=OFF",
                     "-DGGML_CPU_ALL_VARIANTS=OFF",
-                    "-DGGML_CPU_KLEIDIAI=OFF",
+                    "-DGGML_CPU_KLEIDIAI=ON",
+                    "-DGGML_VULKAN=${if (enableVulkanBackend) "ON" else "OFF"}",
+                    "-DGGML_OPENCL=${if (enableOpenClBackend) "ON" else "OFF"}",
                     "-DGGML_LLAMAFILE=OFF",
                 )
             }

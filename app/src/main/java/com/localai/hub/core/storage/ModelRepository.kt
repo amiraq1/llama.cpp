@@ -12,7 +12,7 @@ interface ModelRepository {
     suspend fun queueDownload(modelId: String)
     suspend fun setDownloading(modelId: String)
     suspend fun markDownloaded(modelId: String, localPath: String, version: String)
+    suspend fun markError(modelId: String)
     suspend fun deleteModel(modelId: String)
     suspend fun setActiveModel(modelId: String)
 }
-

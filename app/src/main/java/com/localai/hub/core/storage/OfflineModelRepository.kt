@@ -59,6 +59,10 @@ class OfflineModelRepository @Inject constructor(
         }
     }
 
+    override suspend fun markError(modelId: String) {
+        modelDao.updateDownloadStatus(modelId, DownloadStatus.ERROR.name)
+    }
+
     override suspend fun deleteModel(modelId: String) {
         val model = modelDao.getById(modelId) ?: return
         val builtInSeed = catalog.seedFor(modelId)

@@ -1,6 +1,9 @@
 package com.localai.hub.feature.chat
 
+import com.arm.aichat.BackendPreference
+import com.arm.aichat.FlashAttentionPreference
 import com.localai.hub.core.inference.PerformanceProfile
+import com.localai.hub.core.inference.LlamaKvCachePreset
 import com.localai.hub.core.modelregistry.LocalModel
 import com.localai.hub.core.telemetry.DeviceTelemetry
 
@@ -31,7 +34,14 @@ data class ChatUiState(
     val maxTokens: Int = 384,
     val contextSize: Int = 2048,
     val profile: PerformanceProfile = PerformanceProfile.BALANCED,
+    val backendPreference: BackendPreference = BackendPreference.AUTO,
+    val kvCachePreset: LlamaKvCachePreset = LlamaKvCachePreset.AUTO,
+    val flashAttention: FlashAttentionPreference = FlashAttentionPreference.AUTO,
+    val useMmap: Boolean = true,
+    val useMlock: Boolean = false,
     val isGenerating: Boolean = false,
     val lastLatencyMs: Long? = null,
+    val lastTokensPerSecond: Double? = null,
+    val lastEngineLabel: String? = null,
     val notice: String? = null,
 )

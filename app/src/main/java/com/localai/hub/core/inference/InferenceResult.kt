@@ -5,6 +5,6 @@ sealed interface InferenceResult {
         val content: String,
         val latencyMs: Long,
         val engineLabel: String,
+        val generatedUnits: Int = 0,
     ) : InferenceResult
 }
-

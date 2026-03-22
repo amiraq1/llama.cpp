@@ -20,8 +20,7 @@ interface InferenceEngine {
      */
     suspend fun loadModel(
         pathToModel: String,
-        contextSize: Int = DEFAULT_CONTEXT_SIZE,
-        temperature: Float = DEFAULT_TEMPERATURE,
+        options: ModelLoadOptions = ModelLoadOptions(),
     )
 
     /**
@@ -38,6 +37,11 @@ interface InferenceEngine {
      * Runs a benchmark with the specified parameters.
      */
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String
+
+    /**
+     * Returns the backend currently serving the loaded model.
+     */
+    fun activeBackendName(): String
 
     /**
      * Unloads the currently loaded model.

@@ -2,10 +2,13 @@ package com.localai.hub.feature.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.arm.aichat.BackendPreference
+import com.arm.aichat.FlashAttentionPreference
 import com.localai.hub.core.inference.ChatRuntimeOptions
 import com.localai.hub.core.inference.InferenceInput
 import com.localai.hub.core.inference.InferenceOrchestrator
 import com.localai.hub.core.inference.InferenceResult
+import com.localai.hub.core.inference.LlamaKvCachePreset
 import com.localai.hub.core.inference.PerformanceProfile
 import com.localai.hub.core.modelregistry.DownloadStatus
 import com.localai.hub.core.modelregistry.ModelType
@@ -74,6 +77,26 @@ class ChatViewModel @Inject constructor(
         _uiState.update { state -> state.copy(profile = profile) }
     }
 
+    fun updateBackendPreference(value: BackendPreference) {
+        _uiState.update { state -> state.copy(backendPreference = value) }
+    }
+
+    fun updateKvCachePreset(value: LlamaKvCachePreset) {
+        _uiState.update { state -> state.copy(kvCachePreset = value) }
+    }
+
+    fun updateFlashAttention(value: FlashAttentionPreference) {
+        _uiState.update { state -> state.copy(flashAttention = value) }
+    }
+
+    fun updateUseMmap(value: Boolean) {
+        _uiState.update { state -> state.copy(useMmap = value) }
+    }
+
+    fun updateUseMlock(value: Boolean) {
+        _uiState.update { state -> state.copy(useMlock = value) }
+    }
+
     fun sendMessage() {
         val snapshot = _uiState.value
         val activeModel = snapshot.activeModel
@@ -116,14 +139,27 @@ class ChatViewModel @Inject constructor(
                             temperature = snapshot.temperature,
                             contextSize = snapshot.contextSize,
                             profile = snapshot.profile,
+                            backendPreference = snapshot.backendPreference,
+                            kvCachePreset = snapshot.kvCachePreset,
+                            flashAttention = snapshot.flashAttention,
+                            useMmap = snapshot.useMmap,
+                            useMlock = snapshot.useMlock,
                         ),
                     ),
                 ) as InferenceResult.Text
+
+                val tokensPerSecond = if (result.latencyMs > 0 && result.generatedUnits > 0) {
+                    result.generatedUnits * 1000.0 / result.latencyMs.toDouble()
+                } else {
+                    null
+                }
 
                 _uiState.update { state ->
                     state.copy(
                         isGenerating = false,
                         lastLatencyMs = result.latencyMs,
+                        lastTokensPerSecond = tokensPerSecond,
+                        lastEngineLabel = result.engineLabel,
                         messages = state.messages + ChatMessage(
                             id = System.currentTimeMillis() + 1,
                             role = MessageRole.ASSISTANT,

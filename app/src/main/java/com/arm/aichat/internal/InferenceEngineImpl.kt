@@ -2,7 +2,10 @@ package com.arm.aichat.internal
 
 import android.content.Context
 import android.util.Log
+import com.arm.aichat.BackendPreference
+import com.arm.aichat.FlashAttentionPreference
 import com.arm.aichat.InferenceEngine
+import com.arm.aichat.ModelLoadOptions
 import com.arm.aichat.UnsupportedArchitectureException
 import com.arm.aichat.internal.InferenceEngineImpl.Companion.getInstance
 import dalvik.annotation.optimization.FastNative
@@ -83,10 +86,24 @@ internal class InferenceEngineImpl private constructor(
     private external fun init(nativeLibDir: String)
 
     @FastNative
-    private external fun load(modelPath: String): Int
+    private external fun load(
+        modelPath: String,
+        backendPreference: String,
+        gpuLayers: Int,
+        useMmap: Boolean,
+        useMlock: Boolean,
+    ): Int
 
     @FastNative
-    private external fun prepare(contextSize: Int, temperature: Float): Int
+    private external fun prepare(
+        contextSize: Int,
+        temperature: Float,
+        threads: Int,
+        batchSize: Int,
+        cacheTypeK: String,
+        cacheTypeV: String,
+        flashAttention: Int,
+    ): Int
 
     @FastNative
     private external fun systemInfo(): String
@@ -108,6 +125,9 @@ internal class InferenceEngineImpl private constructor(
 
     @FastNative
     private external fun shutdown()
+
+    @FastNative
+    private external fun activeBackend(): String
 
     private val _state =
         MutableStateFlow<InferenceEngine.State>(InferenceEngine.State.Uninitialized)
@@ -149,8 +169,7 @@ internal class InferenceEngineImpl private constructor(
      */
     override suspend fun loadModel(
         pathToModel: String,
-        contextSize: Int,
-        temperature: Float,
+        options: ModelLoadOptions,
     ) =
         withContext(llamaDispatcher) {
             check(_state.value is InferenceEngine.State.Initialized) {
@@ -168,13 +187,24 @@ internal class InferenceEngineImpl private constructor(
                 Log.i(TAG, "Loading model... \n$pathToModel")
                 _readyForSystemPrompt = false
                 _state.value = InferenceEngine.State.LoadingModel
-                load(pathToModel).let {
+                load(
+                    modelPath = pathToModel,
+                    backendPreference = options.backendPreference.name,
+                    gpuLayers = options.gpuLayers,
+                    useMmap = options.useMmap,
+                    useMlock = options.useMlock,
+                ).let {
                     // TODO-han.yin: find a better way to pass other error codes
                     if (it != 0) throw UnsupportedArchitectureException()
                 }
                 prepare(
-                    contextSize = contextSize.coerceAtLeast(512),
-                    temperature = temperature.coerceIn(0.05f, 2.0f),
+                    contextSize = options.contextSize.coerceAtLeast(512),
+                    temperature = options.temperature.coerceIn(0.05f, 2.0f),
+                    threads = options.threads.coerceIn(0, 16),
+                    batchSize = options.batchSize.coerceIn(32, 2048),
+                    cacheTypeK = options.cacheTypeK.name,
+                    cacheTypeV = options.cacheTypeV.name,
+                    flashAttention = options.flashAttention.nativeValue,
                 ).let {
                     if (it != 0) throw IOException("Failed to prepare resources")
                 }
@@ -281,6 +311,8 @@ internal class InferenceEngineImpl private constructor(
                 _state.value = InferenceEngine.State.ModelReady
             }
         }
+
+    override fun activeBackendName(): String = activeBackend()
 
     /**
      * Unloads the model and frees resources, or reset error states

@@ -3,6 +3,7 @@ package com.localai.hub.feature.chat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -25,6 +26,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -38,6 +40,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import com.arm.aichat.BackendPreference
+import com.arm.aichat.FlashAttentionPreference
+import com.localai.hub.core.inference.LlamaKvCachePreset
 import com.localai.hub.core.inference.PerformanceProfile
 import com.localai.hub.core.modelregistry.displayName
 import com.localai.hub.core.modelregistry.hasRealLocalFile
@@ -47,6 +52,7 @@ import com.localai.hub.ui.theme.DeepInk
 import com.localai.hub.ui.theme.Mist
 import com.localai.hub.ui.theme.Sand
 import com.localai.hub.ui.theme.Sea
+import java.util.Locale
 import kotlin.math.roundToInt
 
 @Composable
@@ -62,6 +68,11 @@ fun ChatRoute(
         onMaxTokensChanged = { value -> viewModel.updateMaxTokens(value.roundToInt()) },
         onContextChanged = { value -> viewModel.updateContextSize(value.roundToInt()) },
         onProfileChanged = viewModel::updateProfile,
+        onBackendPreferenceChanged = viewModel::updateBackendPreference,
+        onKvCachePresetChanged = viewModel::updateKvCachePreset,
+        onFlashAttentionChanged = viewModel::updateFlashAttention,
+        onUseMmapChanged = viewModel::updateUseMmap,
+        onUseMlockChanged = viewModel::updateUseMlock,
     )
 }
 
@@ -74,6 +85,11 @@ private fun ChatScreen(
     onMaxTokensChanged: (Float) -> Unit,
     onContextChanged: (Float) -> Unit,
     onProfileChanged: (PerformanceProfile) -> Unit,
+    onBackendPreferenceChanged: (BackendPreference) -> Unit,
+    onKvCachePresetChanged: (LlamaKvCachePreset) -> Unit,
+    onFlashAttentionChanged: (FlashAttentionPreference) -> Unit,
+    onUseMmapChanged: (Boolean) -> Unit,
+    onUseMlockChanged: (Boolean) -> Unit,
 ) {
     val listState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
@@ -101,6 +117,11 @@ private fun ChatScreen(
             onMaxTokensChanged = onMaxTokensChanged,
             onContextChanged = onContextChanged,
             onProfileChanged = onProfileChanged,
+            onBackendPreferenceChanged = onBackendPreferenceChanged,
+            onKvCachePresetChanged = onKvCachePresetChanged,
+            onFlashAttentionChanged = onFlashAttentionChanged,
+            onUseMmapChanged = onUseMmapChanged,
+            onUseMlockChanged = onUseMlockChanged,
         )
         if (uiState.isGenerating || latestAssistantReply != null) {
             Spacer(modifier = Modifier.height(12.dp))
@@ -226,6 +247,22 @@ private fun HeroStatusCard(uiState: ChatUiState) {
                     style = MaterialTheme.typography.labelLarge,
                 )
             }
+            uiState.lastTokensPerSecond?.let { tps ->
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = String.format(Locale.US, "تقريباً %.2f t/s", tps),
+                    color = Mist,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            uiState.lastEngineLabel?.let { label ->
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = label,
+                    color = Mist,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
             uiState.notice?.let { notice ->
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
@@ -245,6 +282,11 @@ private fun RuntimeControls(
     onMaxTokensChanged: (Float) -> Unit,
     onContextChanged: (Float) -> Unit,
     onProfileChanged: (PerformanceProfile) -> Unit,
+    onBackendPreferenceChanged: (BackendPreference) -> Unit,
+    onKvCachePresetChanged: (LlamaKvCachePreset) -> Unit,
+    onFlashAttentionChanged: (FlashAttentionPreference) -> Unit,
+    onUseMmapChanged: (Boolean) -> Unit,
+    onUseMlockChanged: (Boolean) -> Unit,
 ) {
     Card(shape = RoundedCornerShape(24.dp)) {
         Column(
@@ -258,7 +300,10 @@ private fun RuntimeControls(
                 color = DeepInk,
             )
             Spacer(modifier = Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 PerformanceProfile.entries.forEach { profile ->
                     FilterChip(
                         selected = uiState.profile == profile,
@@ -289,6 +334,77 @@ private fun RuntimeControls(
                 range = 1024f..4096f,
                 onValueChange = onContextChanged,
             )
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "Backend",
+                style = MaterialTheme.typography.titleMedium,
+                color = DeepInk,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                BackendPreference.entries.forEach { option ->
+                    FilterChip(
+                        selected = uiState.backendPreference == option,
+                        onClick = { onBackendPreferenceChanged(option) },
+                        label = { Text(option.name) },
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "KV Cache",
+                style = MaterialTheme.typography.titleMedium,
+                color = DeepInk,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                LlamaKvCachePreset.entries.forEach { option ->
+                    FilterChip(
+                        selected = uiState.kvCachePreset == option,
+                        onClick = { onKvCachePresetChanged(option) },
+                        label = { Text(option.displayName) },
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "Flash Attention",
+                style = MaterialTheme.typography.titleMedium,
+                color = DeepInk,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FlashAttentionPreference.entries.forEach { option ->
+                    FilterChip(
+                        selected = uiState.flashAttention == option,
+                        onClick = { onFlashAttentionChanged(option) },
+                        label = { Text(option.name) },
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            ToggleRow(
+                title = "Use mmap",
+                subtitle = "تحميل الأوزان عبر memory mapping لتقليل الضغط على RAM.",
+                checked = uiState.useMmap,
+                onCheckedChange = onUseMmapChanged,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            ToggleRow(
+                title = "Use mlock",
+                subtitle = "تثبيت الصفحات في الذاكرة عند توفر RAM كافية.",
+                checked = uiState.useMlock,
+                onCheckedChange = onUseMlockChanged,
+            )
         }
     }
 }
@@ -313,6 +429,35 @@ private fun SliderRow(
             value = value,
             onValueChange = onValueChange,
             valueRange = range,
+        )
+    }
+}
+
+@Composable
+private fun ToggleRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = title, fontWeight = FontWeight.SemiBold)
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.labelLarge,
+                color = Sea,
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
         )
     }
 }

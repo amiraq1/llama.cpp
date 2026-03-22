@@ -43,7 +43,6 @@ interface GgufMetadataReader {
 
     companion object {
         private val DEFAULT_SKIP_KEYS = setOf(
-            "tokenizer.chat_template",
             "tokenizer.ggml.scores",
             "tokenizer.ggml.tokens",
             "tokenizer.ggml.token_type"

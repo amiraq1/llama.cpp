@@ -1,115 +1,224 @@
 #include <android/log.h>
 #include <jni.h>
 #include <algorithm>
-#include <iomanip>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <unistd.h>
+#include <vector>
+
 #include <sampling.h>
 
-#include "logging.h"
 #include "chat.h"
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml.h"
 #include "llama.h"
+#include "logging.h"
 
 template<class T>
-static std::string join(const std::vector<T> &values, const std::string &delim) {
+static std::string join(const std::vector<T> & values, const std::string & delim) {
     std::ostringstream str;
     for (size_t i = 0; i < values.size(); i++) {
         str << values[i];
-        if (i < values.size() - 1) { str << delim; }
+        if (i < values.size() - 1) {
+            str << delim;
+        }
     }
     return str.str();
 }
 
-/**
- * LLama resources: context, model, batch and sampler
- */
-constexpr int   N_THREADS_MIN           = 2;
-constexpr int   N_THREADS_MAX           = 4;
-constexpr int   N_THREADS_HEADROOM      = 2;
-constexpr int   OVERFLOW_HEADROOM       = 4;
-constexpr int   BATCH_SIZE              = 512;
+constexpr int N_THREADS_MIN      = 2;
+constexpr int N_THREADS_MAX      = 8;
+constexpr int N_THREADS_HEADROOM = 2;
+constexpr int OVERFLOW_HEADROOM  = 4;
 
-static llama_model                      * g_model;
-static llama_context                    * g_context;
-static llama_batch                        g_batch;
-static common_chat_templates_ptr          g_chat_templates;
-static common_sampler                   * g_sampler;
-static int                                g_context_size = 4096;
-static float                              g_sampler_temp = 0.7f;
+static llama_model *               g_model            = nullptr;
+static llama_context *             g_context          = nullptr;
+static llama_batch                 g_batch            = {};
+static common_chat_templates_ptr   g_chat_templates;
+static common_sampler *            g_sampler          = nullptr;
+
+static int                         g_context_size     = 4096;
+static int                         g_batch_size       = 512;
+static int                         g_thread_count     = 0;
+static float                       g_sampler_temp     = 0.7f;
+static ggml_type                   g_cache_type_k     = GGML_TYPE_F16;
+static ggml_type                   g_cache_type_v     = GGML_TYPE_F16;
+static llama_flash_attn_type       g_flash_attn_type  = LLAMA_FLASH_ATTN_TYPE_AUTO;
+static std::vector<ggml_backend_dev_t> g_backend_devices;
+static std::string                 g_active_backend   = "CPU";
+
+static ggml_type parse_cache_type(const std::string & value) {
+    if (value == "Q8_0") {
+        return GGML_TYPE_Q8_0;
+    }
+    if (value == "Q4_0") {
+        return GGML_TYPE_Q4_0;
+    }
+    return GGML_TYPE_F16;
+}
+
+static int resolve_thread_count(const int requested_threads) {
+    if (requested_threads > 0) {
+        return std::max(N_THREADS_MIN, std::min(N_THREADS_MAX, requested_threads));
+    }
+
+    const int cpu_count = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    return std::max(
+            N_THREADS_MIN,
+            std::min(N_THREADS_MAX, cpu_count - N_THREADS_HEADROOM));
+}
+
+static std::string detect_best_backend_name() {
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        auto * reg = ggml_backend_reg_get(i);
+        const std::string name = ggml_backend_reg_name(reg);
+        if (name != "CPU" && ggml_backend_reg_dev_count(reg) > 0) {
+            return name;
+        }
+    }
+    return "CPU";
+}
+
+static void configure_backend_selection(
+        const std::string & backend_preference,
+        llama_model_params & model_params) {
+    g_backend_devices.clear();
+
+    if (backend_preference == "CPU") {
+        model_params.n_gpu_layers = 0;
+        g_active_backend = "CPU";
+        return;
+    }
+
+    if (backend_preference == "AUTO") {
+        g_active_backend = detect_best_backend_name();
+        return;
+    }
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const std::string reg_name = ggml_backend_reg_name(reg);
+        if (reg_name != backend_preference) {
+            continue;
+        }
+
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+
+        g_backend_devices.push_back(dev);
+    }
+
+    if (g_backend_devices.empty()) {
+        LOGw("%s: backend %s is unavailable, falling back to CPU",
+             __func__, backend_preference.c_str());
+        model_params.n_gpu_layers = 0;
+        g_active_backend = "CPU";
+        return;
+    }
+
+    g_backend_devices.push_back(nullptr);
+    model_params.devices = g_backend_devices.data();
+    if (model_params.n_gpu_layers == 0) {
+        model_params.n_gpu_layers = -1;
+    }
+    g_active_backend = backend_preference;
+}
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject /*unused*/, jstring nativeLibDir) {
-    // Set llama log handler to Android
+Java_com_arm_aichat_internal_InferenceEngineImpl_init(
+        JNIEnv * env,
+        jobject /*unused*/,
+        jstring nativeLibDir) {
     llama_log_set(aichat_android_log_callback, nullptr);
 
-    const auto *path_to_backend = env->GetStringUTFChars(nativeLibDir, 0);
-    LOGi("Preparing backends. nativeLibraryDir=%s", path_to_backend);
-    if (ggml_backend_reg_by_name("CPU") == nullptr) {
-        LOGi("Registering built-in CPU backend");
-        ggml_backend_register(ggml_backend_cpu_reg());
-    }
-    LOGi("Registered backend count after init: %zu", ggml_backend_reg_count());
+    const auto * path_to_backend = env->GetStringUTFChars(nativeLibDir, 0);
+    LOGi("Initializing llama.cpp runtime. nativeLibraryDir=%s", path_to_backend);
     env->ReleaseStringUTFChars(nativeLibDir, path_to_backend);
 
-    // Initialize backends
     llama_backend_init();
-    LOGi("Backend initiated; Log handler set.");
+    LOGi("Backends ready. Registered backend count: %zu", ggml_backend_reg_count());
 }
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_load(
+        JNIEnv * env,
+        jobject,
+        jstring jmodel_path,
+        jstring jbackend_preference,
+        jint gpu_layers,
+        jboolean use_mmap,
+        jboolean use_mlock) {
     llama_model_params model_params = llama_model_default_params();
 
-    const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
-    LOGd("%s: Loading model from: \n%s\n", __func__, model_path);
+    const auto * model_path = env->GetStringUTFChars(jmodel_path, 0);
+    const auto * backend_preference = env->GetStringUTFChars(jbackend_preference, 0);
 
-    auto *model = llama_model_load_from_file(model_path, model_params);
+    model_params.n_gpu_layers = gpu_layers;
+    model_params.use_mmap = use_mmap == JNI_TRUE;
+    model_params.use_mlock = use_mlock == JNI_TRUE;
+    configure_backend_selection(backend_preference, model_params);
+
+    LOGd("%s: Loading model from:\n%s", __func__, model_path);
+    LOGi("%s: backend=%s, n_gpu_layers=%d, mmap=%s, mlock=%s",
+         __func__,
+         backend_preference,
+         model_params.n_gpu_layers,
+         model_params.use_mmap ? "true" : "false",
+         model_params.use_mlock ? "true" : "false");
+
+    auto * model = llama_model_load_from_file(model_path, model_params);
     env->ReleaseStringUTFChars(jmodel_path, model_path);
+    env->ReleaseStringUTFChars(jbackend_preference, backend_preference);
+
     if (!model) {
         return 1;
     }
+
     g_model = model;
     return 0;
 }
 
-static llama_context *init_context(llama_model *model, const int n_ctx = g_context_size) {
+static llama_context * init_context(llama_model * model, const int n_ctx = g_context_size) {
     if (!model) {
         LOGe("%s: model cannot be null", __func__);
         return nullptr;
     }
 
-    // Multi-threading setup
-    const int n_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX,
-                                                     (int) sysconf(_SC_NPROCESSORS_ONLN) -
-                                                     N_THREADS_HEADROOM));
+    const int n_threads = resolve_thread_count(g_thread_count);
     LOGi("%s: Using %d threads", __func__, n_threads);
 
-    // Context parameters setup
     llama_context_params ctx_params = llama_context_default_params();
     const int trained_context_size = llama_model_n_ctx_train(model);
     if (n_ctx > trained_context_size) {
         LOGw("%s: Model was trained with only %d context size! Enforcing %d context size...",
              __func__, trained_context_size, n_ctx);
     }
+
     ctx_params.n_ctx = n_ctx;
-    ctx_params.n_batch = BATCH_SIZE;
-    ctx_params.n_ubatch = BATCH_SIZE;
+    ctx_params.n_batch = g_batch_size;
+    ctx_params.n_ubatch = g_batch_size;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
-    auto *context = llama_init_from_model(g_model, ctx_params);
+    ctx_params.type_k = g_cache_type_k;
+    ctx_params.type_v = g_cache_type_v;
+    ctx_params.flash_attn_type = g_flash_attn_type;
+
+    auto * context = llama_init_from_model(g_model, ctx_params);
     if (context == nullptr) {
-        LOGe("%s: llama_new_context_with_model() returned null)", __func__);
+        LOGe("%s: llama_init_from_model() returned null", __func__);
     }
     return context;
 }
 
-static common_sampler *new_sampler(float temp) {
+static common_sampler * new_sampler(float temp) {
     common_params_sampling sparams;
     sparams.temp = temp;
     return common_sampler_init(g_model, sparams);
@@ -118,50 +227,78 @@ static common_sampler *new_sampler(float temp) {
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(
-        JNIEnv * /*env*/,
+        JNIEnv * env,
         jobject /*unused*/,
         jint context_size,
-        jfloat temperature) {
+        jfloat temperature,
+        jint threads,
+        jint batch_size,
+        jstring jcache_type_k,
+        jstring jcache_type_v,
+        jint flash_attention) {
+    const auto * cache_type_k = env->GetStringUTFChars(jcache_type_k, nullptr);
+    const auto * cache_type_v = env->GetStringUTFChars(jcache_type_v, nullptr);
+
     g_context_size = std::max(512, (int) context_size);
     g_sampler_temp = std::clamp((float) temperature, 0.05f, 2.0f);
+    g_thread_count = std::max(0, (int) threads);
+    g_batch_size = std::clamp((int) batch_size, 32, 2048);
+    g_cache_type_k = parse_cache_type(cache_type_k);
+    g_cache_type_v = parse_cache_type(cache_type_v);
+    g_flash_attn_type = (llama_flash_attn_type) flash_attention;
 
-    auto *context = init_context(g_model, g_context_size);
-    if (!context) { return 1; }
+    env->ReleaseStringUTFChars(jcache_type_k, cache_type_k);
+    env->ReleaseStringUTFChars(jcache_type_v, cache_type_v);
+
+    auto * context = init_context(g_model, g_context_size);
+    if (!context) {
+        return 1;
+    }
+
     g_context = context;
-    g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
+    g_batch = llama_batch_init(g_batch_size, 0, 1);
     g_chat_templates = common_chat_templates_init(g_model, "");
     g_sampler = new_sampler(g_sampler_temp);
     return 0;
 }
 
 static std::string get_backend() {
-    std::vector<std::string> backends;
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        auto *reg = ggml_backend_reg_get(i);
-        std::string name = ggml_backend_reg_name(reg);
-        if (name != "CPU") {
-            backends.push_back(ggml_backend_reg_name(reg));
-        }
-    }
-    return backends.empty() ? "CPU" : join(backends, ",");
+    return g_active_backend.empty() ? "CPU" : g_active_backend;
 }
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_systemInfo(JNIEnv *env, jobject /*unused*/) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_activeBackend(
+        JNIEnv * env,
+        jobject /*unused*/) {
+    return env->NewStringUTF(get_backend().c_str());
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_systemInfo(
+        JNIEnv * env,
+        jobject /*unused*/) {
     return env->NewStringUTF(llama_print_system_info());
 }
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject /*unused*/, jint pp, jint tg,
-                                                      jint pl, jint nr) {
-    auto *context = init_context(g_model, pp);
+Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(
+        JNIEnv * env,
+        jobject /*unused*/,
+        jint pp,
+        jint tg,
+        jint pl,
+        jint nr) {
+    auto * context = init_context(g_model, pp);
     if (!context) {
-        const auto *const err_msg = "Fail to init_context! Bench aborted.";
+        const auto * const err_msg = "Fail to init_context! Bench aborted.";
         LOGe(err_msg);
         return env->NewStringUTF(err_msg);
     }
+
+    llama_batch bench_batch = llama_batch_init(std::max({g_batch_size, (int) pp, (int) pl}), 0, 1);
 
     auto pp_avg = 0.0;
     auto tg_avg = 0.0;
@@ -176,35 +313,33 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     for (nri = 0; nri < nr; nri++) {
         LOGi("Benchmark prompt processing (pp = %d)", pp);
 
-        common_batch_clear(g_batch);
+        common_batch_clear(bench_batch);
 
         const int n_tokens = pp;
         for (i = 0; i < n_tokens; i++) {
-            common_batch_add(g_batch, 0, i, {0}, false);
+            common_batch_add(bench_batch, 0, i, {0}, false);
         }
 
-        g_batch.logits[g_batch.n_tokens - 1] = true;
+        bench_batch.logits[bench_batch.n_tokens - 1] = true;
         llama_memory_clear(llama_get_memory(context), false);
 
         const auto t_pp_start = ggml_time_us();
-        if (llama_decode(context, g_batch) != 0) {
+        if (llama_decode(context, bench_batch) != 0) {
             LOGe("llama_decode() failed during prompt processing");
         }
         const auto t_pp_end = ggml_time_us();
-
-        // bench text generation
 
         LOGi("Benchmark text generation (tg = %d)", tg);
 
         llama_memory_clear(llama_get_memory(context), false);
         const auto t_tg_start = ggml_time_us();
         for (i = 0; i < tg; i++) {
-            common_batch_clear(g_batch);
+            common_batch_clear(bench_batch);
             for (j = 0; j < pl; j++) {
-                common_batch_add(g_batch, 0, i, {j}, true);
+                common_batch_add(bench_batch, 0, i, {j}, true);
             }
 
-            if (llama_decode(context, g_batch) != 0) {
+            if (llama_decode(context, bench_batch) != 0) {
                 LOGe("llama_decode() failed during text generation");
             }
         }
@@ -228,6 +363,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     }
 
     llama_free(context);
+    llama_batch_free(bench_batch);
 
     pp_avg /= double(nr);
     tg_avg /= double(nr);
@@ -258,37 +394,24 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     return env->NewStringUTF(result.str().c_str());
 }
 
-
-/**
- * Completion loop's long-term states:
- * - chat management
- * - position tracking
- */
-constexpr const char *ROLE_SYSTEM       = "system";
-constexpr const char *ROLE_USER         = "user";
-constexpr const char *ROLE_ASSISTANT    = "assistant";
+constexpr const char * ROLE_SYSTEM    = "system";
+constexpr const char * ROLE_USER      = "user";
+constexpr const char * ROLE_ASSISTANT = "assistant";
 
 static std::vector<common_chat_msg> chat_msgs;
-static llama_pos system_prompt_position;
-static llama_pos current_position;
+static llama_pos                    system_prompt_position;
+static llama_pos                    current_position;
 
 static void reset_long_term_states(const bool clear_kv_cache = true) {
     chat_msgs.clear();
     system_prompt_position = 0;
     current_position = 0;
 
-    if (clear_kv_cache)
+    if (clear_kv_cache && g_context) {
         llama_memory_clear(llama_get_memory(g_context), false);
+    }
 }
 
-/**
- * TODO-hyin: implement sliding-window version as a better alternative
- *
- * Context shifting by discarding the older half of the tokens appended after system prompt:
- * - take the [system_prompt_position] first tokens from the original prompt
- * - take half of the last (system_prompt_position - system_prompt_position) tokens
- * - recompute the logits in batches
- */
 static void shift_context() {
     const int n_discard = (current_position - system_prompt_position) / 2;
     LOGi("%s: Discarding %d tokens", __func__, n_discard);
@@ -298,25 +421,19 @@ static void shift_context() {
     LOGi("%s: Context shifting done! Current position: %d", __func__, current_position);
 }
 
-static std::string chat_add_and_format(const std::string &role, const std::string &content) {
+static std::string chat_add_and_format(const std::string & role, const std::string & content) {
     common_chat_msg new_msg;
     new_msg.role = role;
     new_msg.content = content;
     auto formatted = common_chat_format_single(
-            g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, /* use_jinja */ false);
+            g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, false);
     chat_msgs.push_back(new_msg);
-    LOGi("%s: Formatted and added %s message: \n%s\n", __func__, role.c_str(), formatted.c_str());
+    LOGi("%s: Formatted and added %s message:\n%s\n", __func__, role.c_str(), formatted.c_str());
     return formatted;
 }
 
-/**
- * Completion loop's short-term states:
- * - stop generation position
- * - token chars caching
- * - current assistant message being generated
- */
-static llama_pos stop_generation_position;
-static std::string cached_token_chars;
+static llama_pos         stop_generation_position;
+static std::string       cached_token_chars;
 static std::ostringstream assistant_ss;
 
 static void reset_short_term_states() {
@@ -326,25 +443,22 @@ static void reset_short_term_states() {
 }
 
 static int decode_tokens_in_batches(
-        llama_context *context,
-        llama_batch &batch,
-        const llama_tokens &tokens,
+        llama_context * context,
+        llama_batch & batch,
+        const llama_tokens & tokens,
         const llama_pos start_pos,
         const bool compute_last_logit = false) {
-    // Process tokens in batches using the global batch
     LOGd("%s: Decode %d tokens starting at position %d", __func__, (int) tokens.size(), start_pos);
-    for (int i = 0; i < (int) tokens.size(); i += BATCH_SIZE) {
-        const int cur_batch_size = std::min((int) tokens.size() - i, BATCH_SIZE);
+    for (int i = 0; i < (int) tokens.size(); i += g_batch_size) {
+        const int cur_batch_size = std::min((int) tokens.size() - i, g_batch_size);
         common_batch_clear(batch);
         LOGv("%s: Preparing a batch size of %d starting at: %d", __func__, cur_batch_size, i);
 
-        // Shift context if current batch cannot fit into the context
         if (start_pos + i + cur_batch_size >= g_context_size - OVERFLOW_HEADROOM) {
             LOGw("%s: Current batch won't fit into context! Shifting...", __func__);
             shift_context();
         }
 
-        // Add tokens to the batch with proper positions
         for (int j = 0; j < cur_batch_size; j++) {
             const llama_token token_id = tokens[i + j];
             const llama_pos position = start_pos + i + j;
@@ -352,7 +466,6 @@ static int decode_tokens_in_batches(
             common_batch_add(batch, token_id, position, {0}, want_logit);
         }
 
-        // Decode this batch
         const int decode_result = llama_decode(context, batch);
         if (decode_result) {
             LOGe("%s: llama_decode failed w/ %d", __func__, decode_result);
@@ -365,34 +478,28 @@ static int decode_tokens_in_batches(
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
-        JNIEnv *env,
+        JNIEnv * env,
         jobject /*unused*/,
-        jstring jsystem_prompt
-) {
-    // Reset long-term & short-term states
+        jstring jsystem_prompt) {
     reset_long_term_states();
     reset_short_term_states();
 
-    // Obtain system prompt from JEnv
-    const auto *system_prompt = env->GetStringUTFChars(jsystem_prompt, nullptr);
-    LOGd("%s: System prompt received: \n%s", __func__, system_prompt);
+    const auto * system_prompt = env->GetStringUTFChars(jsystem_prompt, nullptr);
+    LOGd("%s: System prompt received:\n%s", __func__, system_prompt);
     std::string formatted_system_prompt(system_prompt);
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
 
-    // Format system prompt if applicable
     const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
     if (has_chat_template) {
         formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, system_prompt);
     }
 
-    // Tokenize system prompt
-    const auto system_tokens = common_tokenize(g_context, formatted_system_prompt,
-                                               has_chat_template, has_chat_template);
-    for (auto id: system_tokens) {
+    const auto system_tokens = common_tokenize(
+            g_context, formatted_system_prompt, has_chat_template, has_chat_template);
+    for (auto id : system_tokens) {
         LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
     }
 
-    // Handle context overflow
     const int max_batch_size = g_context_size - OVERFLOW_HEADROOM;
     if ((int) system_tokens.size() > max_batch_size) {
         LOGe("%s: System prompt too long for context! %d tokens, max: %d",
@@ -400,13 +507,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         return 1;
     }
 
-    // Decode system tokens in batches
     if (decode_tokens_in_batches(g_context, g_batch, system_tokens, current_position)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
 
-    // Update position
     system_prompt_position = current_position = (int) system_tokens.size();
     return 0;
 }
@@ -414,33 +519,27 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
-        JNIEnv *env,
+        JNIEnv * env,
         jobject /*unused*/,
         jstring juser_prompt,
-        jint n_predict
-) {
-    // Reset short-term states
+        jint n_predict) {
     reset_short_term_states();
 
-    // Obtain and tokenize user prompt
-    const auto *const user_prompt = env->GetStringUTFChars(juser_prompt, nullptr);
-    LOGd("%s: User prompt received: \n%s", __func__, user_prompt);
+    const auto * const user_prompt = env->GetStringUTFChars(juser_prompt, nullptr);
+    LOGd("%s: User prompt received:\n%s", __func__, user_prompt);
     std::string formatted_user_prompt(user_prompt);
     env->ReleaseStringUTFChars(juser_prompt, user_prompt);
 
-    // Format user prompt if applicable
     const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
     if (has_chat_template) {
         formatted_user_prompt = chat_add_and_format(ROLE_USER, user_prompt);
     }
 
-    // Decode formatted user prompts
     auto user_tokens = common_tokenize(g_context, formatted_user_prompt, has_chat_template, has_chat_template);
-    for (auto id: user_tokens) {
+    for (auto id : user_tokens) {
         LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
     }
 
-    // Ensure user prompt doesn't exceed the context size by truncating if necessary.
     const int user_prompt_size = (int) user_tokens.size();
     const int max_batch_size = g_context_size - OVERFLOW_HEADROOM;
     if (user_prompt_size > max_batch_size) {
@@ -449,36 +548,32 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
         LOGw("%s: User prompt too long! Skipped %d tokens!", __func__, skipped_tokens);
     }
 
-    // Decode user tokens in batches
     if (decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
 
-    // Update position
     current_position += (int) user_tokens.size();
     stop_generation_position = current_position + n_predict;
     return 0;
 }
 
-static bool is_valid_utf8(const char *string) {
-    if (!string) { return true; }
+static bool is_valid_utf8(const char * string) {
+    if (!string) {
+        return true;
+    }
 
-    const auto *bytes = (const unsigned char *) string;
+    const auto * bytes = (const unsigned char *) string;
     int num;
 
     while (*bytes != 0x00) {
         if ((*bytes & 0x80) == 0x00) {
-            // U+0000 to U+007F
             num = 1;
         } else if ((*bytes & 0xE0) == 0xC0) {
-            // U+0080 to U+07FF
             num = 2;
         } else if ((*bytes & 0xF0) == 0xE0) {
-            // U+0800 to U+FFFF
             num = 3;
         } else if ((*bytes & 0xF8) == 0xF0) {
-            // U+10000 to U+10FFFF
             num = 4;
         } else {
             return false;
@@ -498,26 +593,21 @@ static bool is_valid_utf8(const char *string) {
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
-        JNIEnv *env,
-        jobject /*unused*/
-) {
-    // Infinite text generation via context shifting
+        JNIEnv * env,
+        jobject /*unused*/) {
     if (current_position >= g_context_size - OVERFLOW_HEADROOM) {
         LOGw("%s: Context full! Shifting...", __func__);
         shift_context();
     }
 
-    // Stop if reaching the marked position
     if (current_position >= stop_generation_position) {
         LOGw("%s: STOP: hitting stop position: %d", __func__, stop_generation_position);
         return nullptr;
     }
 
-    // Sample next token
     const auto new_token_id = common_sampler_sample(g_sampler, g_context, -1);
     common_sampler_accept(g_sampler, new_token_id, true);
 
-    // Populate the batch with new token, then decode
     common_batch_clear(g_batch);
     common_batch_add(g_batch, new_token_id, current_position, {0}, true);
     if (llama_decode(g_context, g_batch) != 0) {
@@ -525,25 +615,22 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
         return nullptr;
     }
 
-    // Update position
     current_position++;
 
-    // Stop if next token is EOG
     if (llama_vocab_is_eog(llama_model_get_vocab(g_model), new_token_id)) {
         LOGd("id: %d,\tIS EOG!\nSTOP.", new_token_id);
         chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());
         return nullptr;
     }
 
-    // If not EOG, convert to text
     auto new_token_chars = common_token_to_piece(g_context, new_token_id);
     cached_token_chars += new_token_chars;
 
-    // Create and return a valid UTF-8 Java string
     jstring result = nullptr;
     if (is_valid_utf8(cached_token_chars.c_str())) {
         result = env->NewStringUTF(cached_token_chars.c_str());
-        LOGv("id: %d,\tcached: `%s`,\tnew: `%s`", new_token_id, cached_token_chars.c_str(), new_token_chars.c_str());
+        LOGv("id: %d,\tcached: `%s`,\tnew: `%s`",
+             new_token_id, cached_token_chars.c_str(), new_token_chars.c_str());
 
         assistant_ss << cached_token_chars;
         cached_token_chars.clear();
@@ -554,24 +641,31 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     return result;
 }
 
-
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/) {
-    // Reset long-term & short-term states
+Java_com_arm_aichat_internal_InferenceEngineImpl_unload(
+        JNIEnv * /*unused*/,
+        jobject /*unused*/) {
     reset_long_term_states();
     reset_short_term_states();
 
-    // Free up resources
     common_sampler_free(g_sampler);
+    g_sampler = nullptr;
     g_chat_templates.reset();
     llama_batch_free(g_batch);
     llama_free(g_context);
     llama_model_free(g_model);
+
+    g_context = nullptr;
+    g_model = nullptr;
+    g_active_backend = "CPU";
+    g_backend_devices.clear();
 }
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject /*unused*/) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(
+        JNIEnv *,
+        jobject /*unused*/) {
     llama_backend_free();
 }

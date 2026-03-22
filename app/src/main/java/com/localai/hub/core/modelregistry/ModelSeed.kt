@@ -15,5 +15,7 @@ data class ModelSeed(
     val downloadedByDefault: Boolean = false,
     val activeByDefault: Boolean = false,
     val version: String? = null,
+    val downloadUrl: String? = null,
+    val downloadSha256: String? = null,
+    val downloadFileName: String? = null,
 )
-

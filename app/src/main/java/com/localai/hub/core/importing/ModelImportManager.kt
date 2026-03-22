@@ -19,7 +19,13 @@ import kotlinx.coroutines.withContext
 class ModelImportManager @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
-    private val ggufReader = GgufMetadataReader.create()
+    private val ggufReader = GgufMetadataReader.create(
+        skipKeys = setOf(
+            "tokenizer.ggml.scores",
+            "tokenizer.ggml.tokens",
+            "tokenizer.ggml.token_type",
+        ),
+    )
 
     suspend fun importModel(
         model: LocalModel,
@@ -43,9 +49,19 @@ class ModelImportManager @Inject constructor(
             }
         } ?: throw IOException("تعذر فتح الملف المحدد.")
 
+        val metadataInput = targetFile.inputStream().buffered()
+        val metadata = try {
+            ggufReader.readStructuredMetadata(metadataInput)
+        } finally {
+            metadataInput.close()
+        }
+
         ImportedModel(
             absolutePath = targetFile.absolutePath,
-            version = resolveDisplayName(uri) ?: targetFile.name,
+            version = resolveVersionLabel(
+                metadata = metadata,
+                fallbackName = resolveDisplayName(uri) ?: targetFile.name,
+            ),
         )
     }
 
@@ -53,6 +69,19 @@ class ModelImportManager @Inject constructor(
         val projection = arrayOf(OpenableColumns.DISPLAY_NAME)
         return context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
             cursor.firstStringOrNull(OpenableColumns.DISPLAY_NAME)
+        }
+    }
+
+    private fun resolveVersionLabel(
+        metadata: com.arm.aichat.gguf.GgufMetadata,
+        fallbackName: String,
+    ): String {
+        val modelName = metadata.basic.nameLabel ?: metadata.basic.name
+        val sizeLabel = metadata.basic.sizeLabel
+        return when {
+            !modelName.isNullOrBlank() && !sizeLabel.isNullOrBlank() -> "$modelName ($sizeLabel)"
+            !modelName.isNullOrBlank() -> modelName
+            else -> fallbackName
         }
     }
 }

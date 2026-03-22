@@ -1,8 +1,10 @@
 package com.localai.hub.core.download
 
 import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.Constraints
 import androidx.work.workDataOf
 import com.localai.hub.core.storage.ModelRepository
 import javax.inject.Inject
@@ -16,6 +18,11 @@ class ModelDownloadScheduler @Inject constructor(
     suspend fun enqueue(modelId: String) {
         repository.queueDownload(modelId)
         val request = OneTimeWorkRequestBuilder<ModelDownloadWorker>()
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build(),
+            )
             .setInputData(workDataOf(ModelDownloadWorker.KEY_MODEL_ID to modelId))
             .build()
         workManager.enqueueUniqueWork(
@@ -29,4 +36,3 @@ class ModelDownloadScheduler @Inject constructor(
         workManager.cancelUniqueWork(ModelDownloadWorker.uniqueWorkName(modelId))
     }
 }
-
